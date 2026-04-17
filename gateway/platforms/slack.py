@@ -409,14 +409,61 @@ class SlackAdapter(BasePlatformAdapter):
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"File not found: {file_path}")
 
-        result = await self._get_client(chat_id).files_upload_v2(
-            channel=chat_id,
-            file=file_path,
-            filename=os.path.basename(file_path),
-            initial_comment=caption or "",
-            thread_ts=self._resolve_thread_ts(reply_to, metadata),
-        )
-        return SendResult(success=True, raw_response=result)
+        thread_ts = self._resolve_thread_ts(reply_to, metadata)
+        last_exc = None
+        for attempt in range(3):
+            try:
+                result = await self._get_client(chat_id).files_upload_v2(
+                    channel=chat_id,
+                    file=file_path,
+                    filename=os.path.basename(file_path),
+                    initial_comment=caption or "",
+                    thread_ts=thread_ts,
+                )
+                self._record_uploaded_file_thread(chat_id, thread_ts)
+                return SendResult(success=True, raw_response=result)
+            except Exception as exc:
+                last_exc = exc
+                if not self._is_retryable_upload_error(exc) or attempt >= 2:
+                    raise
+                logger.debug(
+                    "[Slack] Upload retry %d/2 for %s: %s",
+                    attempt + 1,
+                    file_path,
+                    exc,
+                )
+                await asyncio.sleep(1.5 * (attempt + 1))
+
+        raise last_exc
+
+    def _record_uploaded_file_thread(self, chat_id: str, thread_ts: Optional[str]) -> None:
+        """Treat successful file uploads as bot participation in a thread."""
+        if not thread_ts:
+            return
+        self._bot_message_ts.add(thread_ts)
+        if len(self._bot_message_ts) > self._BOT_TS_MAX:
+            excess = len(self._bot_message_ts) - self._BOT_TS_MAX // 2
+            for old_ts in list(self._bot_message_ts)[:excess]:
+                self._bot_message_ts.discard(old_ts)
+
+    def _is_retryable_upload_error(self, exc: Exception) -> bool:
+        """Best-effort detection for transient Slack upload failures."""
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        if status_code is not None:
+            return status_code == 429 or status_code >= 500
+
+        body = " ".join(
+            str(part) for part in (
+                exc,
+                getattr(exc, "message", ""),
+                getattr(exc, "response", None),
+            ) if part
+        ).lower()
+        if "rate_limited" in body or "ratelimited" in body or "429" in body:
+            return True
+        if "connection reset" in body or "service unavailable" in body or "temporarily unavailable" in body:
+            return True
+        return self._is_retryable_error(body)
 
     # ----- Markdown → mrkdwn conversion -----
 
@@ -657,13 +704,15 @@ class SlackAdapter(BasePlatformAdapter):
                 response = await client.get(image_url)
                 response.raise_for_status()
 
+            thread_ts = self._resolve_thread_ts(reply_to, metadata)
             result = await self._get_client(chat_id).files_upload_v2(
                 channel=chat_id,
                 content=response.content,
                 filename="image.png",
                 initial_comment=caption or "",
-                thread_ts=self._resolve_thread_ts(reply_to, metadata),
+                thread_ts=thread_ts,
             )
+            self._record_uploaded_file_thread(chat_id, thread_ts)
 
             return SendResult(success=True, raw_response=result)
 
@@ -676,7 +725,12 @@ class SlackAdapter(BasePlatformAdapter):
             )
             # Fall back to sending the URL as text
             text = f"{caption}\n{image_url}" if caption else image_url
-            return await self.send(chat_id=chat_id, content=text, reply_to=reply_to)
+            return await self.send(
+                chat_id=chat_id,
+                content=text,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
 
     async def send_voice(
         self,
@@ -717,14 +771,32 @@ class SlackAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"Video file not found: {video_path}")
 
         try:
-            result = await self._get_client(chat_id).files_upload_v2(
-                channel=chat_id,
-                file=video_path,
-                filename=os.path.basename(video_path),
-                initial_comment=caption or "",
-                thread_ts=self._resolve_thread_ts(reply_to, metadata),
-            )
-            return SendResult(success=True, raw_response=result)
+            thread_ts = self._resolve_thread_ts(reply_to, metadata)
+            last_exc = None
+            for attempt in range(3):
+                try:
+                    result = await self._get_client(chat_id).files_upload_v2(
+                        channel=chat_id,
+                        file=video_path,
+                        filename=os.path.basename(video_path),
+                        initial_comment=caption or "",
+                        thread_ts=thread_ts,
+                    )
+                    self._record_uploaded_file_thread(chat_id, thread_ts)
+                    return SendResult(success=True, raw_response=result)
+                except Exception as exc:
+                    last_exc = exc
+                    if not self._is_retryable_upload_error(exc) or attempt >= 2:
+                        raise
+                    logger.debug(
+                        "[Slack] Video upload retry %d/2 for %s: %s",
+                        attempt + 1,
+                        video_path,
+                        exc,
+                    )
+                    await asyncio.sleep(1.5 * (attempt + 1))
+
+            raise last_exc
 
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error(
@@ -756,16 +828,34 @@ class SlackAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"File not found: {file_path}")
 
         display_name = file_name or os.path.basename(file_path)
+        thread_ts = self._resolve_thread_ts(reply_to, metadata)
 
         try:
-            result = await self._get_client(chat_id).files_upload_v2(
-                channel=chat_id,
-                file=file_path,
-                filename=display_name,
-                initial_comment=caption or "",
-                thread_ts=self._resolve_thread_ts(reply_to, metadata),
-            )
-            return SendResult(success=True, raw_response=result)
+            last_exc = None
+            for attempt in range(3):
+                try:
+                    result = await self._get_client(chat_id).files_upload_v2(
+                        channel=chat_id,
+                        file=file_path,
+                        filename=display_name,
+                        initial_comment=caption or "",
+                        thread_ts=thread_ts,
+                    )
+                    self._record_uploaded_file_thread(chat_id, thread_ts)
+                    return SendResult(success=True, raw_response=result)
+                except Exception as exc:
+                    last_exc = exc
+                    if not self._is_retryable_upload_error(exc) or attempt >= 2:
+                        raise
+                    logger.debug(
+                        "[Slack] Document upload retry %d/2 for %s: %s",
+                        attempt + 1,
+                        file_path,
+                        exc,
+                    )
+                    await asyncio.sleep(1.5 * (attempt + 1))
+
+            raise last_exc
 
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error(
@@ -1087,7 +1177,6 @@ class SlackAdapter(BasePlatformAdapter):
                     cached = await self._download_slack_file(url, ext, team_id=team_id)
                     media_urls.append(cached)
                     media_types.append(mimetype)
-                    msg_type = MessageType.PHOTO
                 except Exception as e:  # pragma: no cover - defensive logging
                     logger.warning("[Slack] Failed to cache image from %s: %s", url, e, exc_info=True)
             elif mimetype.startswith("audio/") and url:
@@ -1098,7 +1187,6 @@ class SlackAdapter(BasePlatformAdapter):
                     cached = await self._download_slack_file(url, ext, audio=True, team_id=team_id)
                     media_urls.append(cached)
                     media_types.append(mimetype)
-                    msg_type = MessageType.VOICE
                 except Exception as e:  # pragma: no cover - defensive logging
                     logger.warning("[Slack] Failed to cache audio from %s: %s", url, e, exc_info=True)
             elif url:
@@ -1133,7 +1221,6 @@ class SlackAdapter(BasePlatformAdapter):
                     doc_mime = SUPPORTED_DOCUMENT_TYPES[ext]
                     media_urls.append(cached_path)
                     media_types.append(doc_mime)
-                    msg_type = MessageType.DOCUMENT
                     logger.debug("[Slack] Cached user document: %s", cached_path)
 
                     # Inject text content for .txt/.md files (capped at 100 KB)
@@ -1153,6 +1240,14 @@ class SlackAdapter(BasePlatformAdapter):
 
                 except Exception as e:  # pragma: no cover - defensive logging
                     logger.warning("[Slack] Failed to cache document from %s: %s", url, e, exc_info=True)
+
+        if msg_type != MessageType.COMMAND and media_types:
+            if any(m.startswith("image/") for m in media_types):
+                msg_type = MessageType.PHOTO
+            elif any(m.startswith("audio/") for m in media_types):
+                msg_type = MessageType.VOICE
+            else:
+                msg_type = MessageType.DOCUMENT
 
         # Resolve user display name (cached after first lookup)
         user_name = await self._resolve_user_name(user_id, chat_id=channel_id)
@@ -1629,10 +1724,19 @@ class SlackAdapter(BasePlatformAdapter):
                         headers={"Authorization": f"Bearer {bot_token}"},
                     )
                     response.raise_for_status()
+                    ct = response.headers.get("content-type", "")
+                    if "text/html" in ct:
+                        raise ValueError(
+                            "Slack returned HTML instead of file bytes "
+                            f"(content-type: {ct}); "
+                            "check bot token scopes and file permissions"
+                        )
                     return response.content
-                except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
+                except (httpx.TimeoutException, httpx.HTTPStatusError, ValueError) as exc:
                     last_exc = exc
                     if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 429:
+                        raise
+                    if isinstance(exc, ValueError):
                         raise
                     if attempt < 2:
                         logger.debug("Slack file download retry %d/2 for %s: %s",
