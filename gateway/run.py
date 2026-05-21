@@ -42,7 +42,7 @@ from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Optional, Any, List, Union
+from typing import Callable, Coroutine, Dict, Optional, Any, List, Union, cast
 
 # account_usage imports the OpenAI SDK chain (~230 ms). Only needed by
 # /usage; we still import it at module top in the gateway because test
@@ -1600,7 +1600,7 @@ class GatewayRunner:
         
         # Event hook system
         from gateway.hooks import HookRegistry
-        self.hooks = HookRegistry()
+        self.hooks = HookRegistry(include_builtins=True)
 
         # Per-chat voice reply mode: "off" | "voice_only" | "all"
         self._voice_mode: Dict[str, str] = self._load_voice_modes()
@@ -8411,18 +8411,22 @@ class GatewayRunner:
             run_generation,
         )
 
-        try:
-            # Emit agent:start hook
-            hook_ctx = {
-                "platform": source.platform.value if source.platform else "",
-                "user_id": source.user_id,
-                "chat_id": source.chat_id or "",
-                "session_id": session_entry.session_id,
-                "message": message_text[:500],
-            }
-            await self.hooks.emit("agent:start", hook_ctx)
+        hook_ctx = {
+            "platform": source.platform.value if source.platform else "",
+            "user_id": source.user_id,
+            "chat_id": source.chat_id or "",
+            "session_id": session_entry.session_id,
+            "message": message_text[:500],
+            "message_full": message_text,
+            "message_truncated": len(message_text) > 500,
+            "message_id": self._reply_anchor_for_event(event),
+            "gateway_config": getattr(self, "config", None),
+        }
 
-            # Run the agent
+        try:
+            # Run the agent. The agent:start hook is emitted inside _run_agent
+            # after the AIAgent exists so live swarm delegation can receive a
+            # real parent-agent-backed delegate function instead of blocking.
             agent_result = await self._run_agent(
                 message=message_text,
                 context_prompt=context_prompt,
@@ -9402,6 +9406,15 @@ class GatewayRunner:
             "",
             t("gateway.status.platforms", platforms=', '.join(connected_platforms)),
         ])
+
+        try:
+            from agent.swarm_status import load_swarm_status_text
+
+            swarm_status = load_swarm_status_text(session_id=session_entry.session_id)
+            if swarm_status:
+                lines.extend(["", swarm_status])
+        except Exception as exc:  # pragma: no cover — optional status surface
+            logger.debug("swarm status load failed in /status: %s", exc)
 
         # Session recap — what was this session ABOUT? Pure local compute,
         # no LLM call, no prompt-cache impact. Useful when juggling multiple
@@ -15394,6 +15407,61 @@ class GatewayRunner:
 
     # ------------------------------------------------------------------
 
+    def _make_swarm_delegate_fn(self, agent):
+        """Return the live swarm delegate bridge for an already-built parent agent."""
+
+        def _swarm_delegate_fn(*, tasks):
+            from tools.delegate_tool import delegate_task
+
+            return delegate_task(tasks=tasks, parent_agent=agent)
+
+        return _swarm_delegate_fn
+
+    def _emit_agent_start_hook_sync(
+        self,
+        *,
+        source: SessionSource,
+        session_id: str,
+        message: str,
+        event_message_id: Optional[str],
+        agent=None,
+    ) -> None:
+        """Emit agent:start from the worker thread after agent construction.
+
+        Live swarm delegation needs an injected function backed by the real
+        parent AIAgent. Emitting here keeps shadow hooks unchanged while making
+        the explicit live gate reachable from gateway sessions.
+        """
+        hooks = getattr(self, "hooks", None)
+        emit = getattr(hooks, "emit", None) if hooks is not None else None
+        if not callable(emit):
+            return
+        emit_hook = cast(Callable[[str, Dict[str, Any]], Coroutine[Any, Any, Any]], emit)
+        hook_ctx = {
+            "platform": source.platform.value if source.platform else "",
+            "user_id": source.user_id,
+            "chat_id": source.chat_id or "",
+            "session_id": session_id,
+            "message": (message or "")[:500],
+            "message_full": message,
+            "message_truncated": len(message or "") > 500,
+            "message_id": event_message_id,
+            "gateway_config": getattr(self, "config", None),
+        }
+        if agent is not None:
+            hook_ctx["swarm_delegate_fn"] = self._make_swarm_delegate_fn(agent)
+        try:
+            asyncio.run(emit_hook("agent:start", hook_ctx))
+        except RuntimeError:
+            # Defensive fallback for unusual test harnesses that call this from
+            # a thread with an active loop. Production _run_agent uses an
+            # executor worker thread, where asyncio.run is valid.
+            loop = asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(emit_hook("agent:start", hook_ctx))
+            finally:
+                loop.close()
+
     async def _run_agent(
         self,
         message: str,
@@ -16703,6 +16771,14 @@ class GatewayRunner:
                 _srn = _pending_notes.pop(session_key, None)
                 if _srn:
                     message = _srn + "\n\n" + message
+
+            self._emit_agent_start_hook_sync(
+                source=source,
+                session_id=session_id,
+                message=message,
+                event_message_id=event_message_id,
+                agent=agent,
+            )
 
             _approval_session_key = session_key or ""
             _approval_session_token = set_current_session_key(_approval_session_key)

@@ -42,10 +42,11 @@ class HookRegistry:
         await registry.emit("agent:start", {"platform": "telegram", ...})
     """
 
-    def __init__(self):
+    def __init__(self, include_builtins: bool = False):
         # event_type -> [handler_fn, ...]
         self._handlers: Dict[str, List[Callable]] = {}
         self._loaded_hooks: List[dict] = []  # metadata for listing
+        self.include_builtins = include_builtins
 
     @property
     def loaded_hooks(self) -> List[dict]:
@@ -55,11 +56,23 @@ class HookRegistry:
     def _register_builtin_hooks(self) -> None:
         """Register built-in hooks that are always active.
 
-        Currently empty — no shipped built-in hooks. Kept as the extension
-        point for future always-on gateway hooks so they drop in without
-        re-plumbing discover_and_load().
+        Built-in hooks must be safe when their feature config is disabled; the
+        swarm operator hook defaults disabled and only records shadow state when
+        explicitly enabled.
         """
-        return
+        try:
+            from gateway.builtin_hooks.swarm_operator import handle as swarm_operator_handle
+        except Exception as exc:
+            print(f"[hooks] Error loading built-in swarm operator hook: {exc}", flush=True)
+            return
+
+        self._handlers.setdefault("agent:start", []).append(swarm_operator_handle)
+        self._loaded_hooks.append({
+            "name": "swarm_operator",
+            "description": "Jeeves swarm operator shadow audit hook",
+            "events": ["agent:start"],
+            "path": "gateway.builtin_hooks.swarm_operator",
+        })
 
     def discover_and_load(self) -> None:
         """
@@ -71,7 +84,8 @@ class HookRegistry:
           - HOOK.yaml with at least 'name' and 'events' keys
           - handler.py with a top-level 'handle' function (sync or async)
         """
-        self._register_builtin_hooks()
+        if self.include_builtins:
+            self._register_builtin_hooks()
 
         if not HOOKS_DIR.exists():
             return

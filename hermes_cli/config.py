@@ -506,6 +506,18 @@ DEFAULT_CONFIG = {
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
+    # Jeeves swarm operator is an experimental gateway/agent coordination
+    # surface. It is disabled by default and remains dry-run/shadow-only until a
+    # user explicitly opts in via their profile config.
+    "swarm_operator": {
+        "enabled": False,
+        "dry_run": True,
+        "live_delegation_enabled": False,
+        "live_delegation_timeout_seconds": 30.0,
+        "max_children": 3,
+        "persist_to_honcho": False,
+        "honcho_summary_enabled": False,
+    },
     "agent": {
         "max_turns": 90,
         # Inactivity timeout for gateway agent execution (seconds).
