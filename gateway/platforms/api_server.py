@@ -38,6 +38,7 @@ import os
 import socket as _socket
 import re
 import sqlite3
+import tempfile
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -1010,7 +1011,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_stop": True,
                 "voice_sessions": True,
                 "voice_text_turns": True,
-                "voice_audio_upload": False,
+                "voice_audio_upload": True,
                 "voice_tts": "optional_best_effort",
                 "run_approval_response": True,
                 "tool_progress_events": True,
@@ -1049,7 +1050,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "turn_count": len(session.get("turns", [])),
             "capabilities": {
                 "text_turns": True,
-                "audio_upload": False,
+                "audio_upload": True,
                 "tts": "optional_best_effort",
             },
         }
@@ -1179,12 +1180,11 @@ class APIServerAdapter(BasePlatformAdapter):
         return payload
 
     async def _handle_voice_turn(self, request: "web.Request") -> "web.Response":
-        """POST /v1/voice/sessions/{voice_session_id}/turns — submit one text turn.
+        """POST /v1/voice/sessions/{voice_session_id}/turns.
 
-        MVP boundary: this endpoint does not accept raw audio yet.  iOS should
-        use device speech recognition (or another STT service) and submit the
-        transcript as ``text``.  If an ``audio`` field is supplied without text,
-        the server returns 501 with a machine-readable capability hint.
+        Accepts either a JSON text transcript or multipart/form-data with an
+        ``audio`` file field. Multipart audio is transcribed server-side using
+        Hermes' configured STT provider, then processed as a normal agent turn.
         """
         auth_err = self._check_auth(request)
         if auth_err:
@@ -1195,24 +1195,107 @@ class APIServerAdapter(BasePlatformAdapter):
         if session.get("status") != "active":
             return web.json_response(_openai_error("Voice session has ended", code="voice_session_ended"), status=409)
 
-        try:
-            body = await request.json()
-        except (json.JSONDecodeError, Exception):
-            return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
-        if not isinstance(body, dict):
-            return web.json_response(_openai_error("Request body must be a JSON object"), status=400)
+        body: Dict[str, Any] = {}
+        audio_file_path: Optional[str] = None
+        is_multipart_audio_turn = False
+        content_type = request.headers.get("Content-Type", "").lower()
+
+        if content_type.startswith("multipart/"):
+            try:
+                reader = await request.multipart()
+                async for part in reader:
+                    field_name = part.name or ""
+                    if field_name in {"text", "transcript", "tts", "include_audio_base64"}:
+                        body[field_name] = await part.text()
+                        continue
+                    if field_name != "audio":
+                        await part.release()
+                        continue
+
+                    is_multipart_audio_turn = True
+                    raw_suffix = os.path.splitext(part.filename or "")[1]
+                    guessed_suffix = mimetypes.guess_extension(part.headers.get("Content-Type", "")) or ""
+                    suffix = raw_suffix or guessed_suffix or ".m4a"
+                    fd, audio_file_path = tempfile.mkstemp(prefix="hermes_voice_", suffix=suffix)
+                    bytes_written = 0
+                    with os.fdopen(fd, "wb") as fh:
+                        while True:
+                            chunk = await part.read_chunk()
+                            if not chunk:
+                                break
+                            bytes_written += len(chunk)
+                            if bytes_written > MAX_REQUEST_BYTES:
+                                fh.close()
+                                try:
+                                    os.unlink(audio_file_path)
+                                except OSError:
+                                    pass
+                                return web.json_response(
+                                    _openai_error("Audio upload is too large", code="voice_audio_too_large"),
+                                    status=413,
+                                )
+                            fh.write(chunk)
+                    if bytes_written == 0:
+                        try:
+                            os.unlink(audio_file_path)
+                        except OSError:
+                            pass
+                        return web.json_response(_openai_error("Audio upload was empty", param="audio"), status=400)
+            except Exception as exc:
+                if audio_file_path:
+                    try:
+                        os.unlink(audio_file_path)
+                    except OSError:
+                        pass
+                logger.warning("voice multipart parsing failed: %s", exc)
+                return web.json_response(_openai_error("Invalid multipart voice turn", code="invalid_voice_multipart"), status=400)
+        else:
+            try:
+                parsed = await request.json()
+            except (json.JSONDecodeError, Exception):
+                return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
+            if not isinstance(parsed, dict):
+                return web.json_response(_openai_error("Request body must be a JSON object"), status=400)
+            body = parsed
 
         text = body.get("text") or body.get("transcript")
         if text is not None and not isinstance(text, str):
+            if audio_file_path:
+                try:
+                    os.unlink(audio_file_path)
+                except OSError:
+                    pass
             return web.json_response(_openai_error("text must be a string", param="text"), status=400)
+
+        if (not text or not text.strip()) and audio_file_path:
+            try:
+                from tools.transcription_tools import transcribe_audio
+
+                transcription = await asyncio.to_thread(transcribe_audio, audio_file_path)
+            finally:
+                try:
+                    os.unlink(audio_file_path)
+                except OSError:
+                    pass
+            if not transcription.get("success"):
+                return web.json_response(
+                    _openai_error(
+                        transcription.get("error") or "Audio transcription failed",
+                        code="voice_transcription_failed",
+                    ),
+                    status=502,
+                )
+            text = transcription.get("transcript", "")
+            body["transcription"] = transcription
+
         if not text or not text.strip():
             if body.get("audio") is not None:
                 return web.json_response(
                     _openai_error(
-                        "Audio upload/STT is not implemented on this MVP endpoint. Submit a transcript in the text field.",
-                        code="voice_audio_not_supported",
+                        "JSON audio payloads are not supported. Upload audio as multipart/form-data with an audio file field.",
+                        code="voice_audio_requires_multipart",
                     ),
-                    status=501,
+                    status=415,
                 )
             return web.json_response(_openai_error("Missing required text transcript", param="text"), status=400)
         text = text.strip()[:MAX_NORMALIZED_TEXT_LENGTH]
@@ -1241,11 +1324,11 @@ class APIServerAdapter(BasePlatformAdapter):
             "reply": reply_text,
             "usage": usage,
         }
-        include_tts = _coerce_request_bool(body.get("tts"), default=False)
+        include_tts = _coerce_request_bool(body.get("tts"), default=is_multipart_audio_turn)
         if include_tts:
             turn["audio"] = self._build_voice_tts_payload(
                 reply_text,
-                include_base64=_coerce_request_bool(body.get("include_audio_base64"), default=False),
+                include_base64=_coerce_request_bool(body.get("include_audio_base64"), default=is_multipart_audio_turn),
             )
         session["turns"].append(turn)
         session["updated_at"] = turn["created_at"]

@@ -20,14 +20,30 @@ struct CreateVoiceSessionResponse: Codable {
     let id: String
 }
 
+struct VoiceTurnAudio: Codable {
+    let success: Bool?
+    let base64: String?
+    let mimeType: String?
+    let audioURL: URL?
+
+    enum CodingKeys: String, CodingKey {
+        case success
+        case base64
+        case mimeType = "mime_type"
+        case audioURL = "audio_url"
+    }
+}
+
 struct CreateTurnResponse: Codable {
     let transcript: String?
     let reply: String?
+    let audio: VoiceTurnAudio?
     let audioURL: URL?
 
     enum CodingKeys: String, CodingKey {
         case transcript
         case reply
+        case audio
         case audioURL = "audio_url"
     }
 }

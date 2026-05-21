@@ -7,6 +7,15 @@ final class AudioPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
     private var player: AVAudioPlayer?
 
+    func play(data: Data) throws {
+        let player = try AVAudioPlayer(data: data)
+        player.delegate = self
+        player.prepareToPlay()
+        player.play()
+        self.player = player
+        isPlaying = true
+    }
+
     func play(localFileURL: URL) throws {
         let player = try AVAudioPlayer(contentsOf: localFileURL)
         player.delegate = self

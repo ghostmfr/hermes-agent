@@ -22,6 +22,8 @@
 	<string>1</string>
 	<key>HERMES_SERVER_URL</key>
 	<string>$(HERMES_SERVER_URL)</string>
+	<key>HERMES_API_KEY</key>
+	<string>$(HERMES_API_KEY)</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsArbitraryLoads</key>
