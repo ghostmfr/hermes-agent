@@ -3,7 +3,7 @@
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from aiohttp import web
+from aiohttp import FormData, web
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import PlatformConfig
@@ -35,7 +35,7 @@ async def test_capabilities_advertise_voice_session_contract():
 
     assert data["features"]["voice_sessions"] is True
     assert data["features"]["voice_text_turns"] is True
-    assert data["features"]["voice_audio_upload"] is False
+    assert data["features"]["voice_audio_upload"] is True
     assert data["endpoints"]["voice_turns"]["path"] == "/v1/voice/sessions/{voice_session_id}/turns"
 
 
@@ -50,7 +50,7 @@ async def test_create_get_and_hangup_voice_session():
 
         assert created["object"] == "hermes.voice_session"
         assert created["status"] == "active"
-        assert created["capabilities"]["audio_upload"] is False
+        assert created["capabilities"]["audio_upload"] is True
         assert created["hermes_session_id"].startswith("api-voice-")
 
         got = await cli.get(f"/v1/voice/sessions/{voice_session_id}")
@@ -114,7 +114,56 @@ async def test_text_turn_runs_agent_tracks_history_and_optional_tts(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_audio_only_turn_documents_mvp_boundary():
+async def test_multipart_audio_turn_transcribes_runs_agent_and_returns_tts(tmp_path):
+    adapter = _adapter()
+    reply_path = tmp_path / "reply.mp3"
+    reply_path.write_bytes(b"fake mp3")
+
+    async with TestClient(TestServer(_make_app(adapter))) as cli:
+        create = await cli.post("/v1/voice/sessions", json={})
+        voice_session_id = (await create.json())["id"]
+
+        form = FormData()
+        form.add_field(
+            "audio",
+            b"fake m4a bytes",
+            filename="turn.m4a",
+            content_type="audio/mp4",
+        )
+
+        run_agent = AsyncMock(return_value=({"final_response": "Heard you", "session_id": "audio-session"}, {"total_tokens": 4}))
+        with patch.object(adapter, "_run_agent", run_agent), patch(
+            "tools.transcription_tools.transcribe_audio",
+            return_value={"success": True, "transcript": "Audio hello", "provider": "test"},
+        ), patch(
+            "tools.tts_tool.text_to_speech_tool",
+            return_value=(
+                '{"success": true, "file_path": "'
+                + str(reply_path)
+                + '", "media_tag": "MEDIA:'
+                + str(reply_path)
+                + '", "provider": "test"}'
+            ),
+        ):
+            resp = await cli.post(f"/v1/voice/sessions/{voice_session_id}/turns", data=form)
+
+        assert resp.status == 200
+        data = await resp.json()
+
+    assert data["object"] == "hermes.voice_turn"
+    assert data["transcript"] == "Audio hello"
+    assert data["reply"] == "Heard you"
+    assert data["audio"]["success"] is True
+    assert data["audio"]["base64"] == "ZmFrZSBtcDM="
+    run_agent.assert_awaited_once()
+    assert adapter._voice_sessions[voice_session_id]["history"] == [
+        {"role": "user", "content": "Audio hello"},
+        {"role": "assistant", "content": "Heard you"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_json_audio_turn_documents_multipart_boundary():
     adapter = _adapter()
     async with TestClient(TestServer(_make_app(adapter))) as cli:
         create = await cli.post("/v1/voice/sessions", json={})
@@ -124,11 +173,11 @@ async def test_audio_only_turn_documents_mvp_boundary():
             f"/v1/voice/sessions/{voice_session_id}/turns",
             json={"audio": {"base64": "AAAA", "mime_type": "audio/wav"}},
         )
-        assert resp.status == 501
+        assert resp.status == 415
         data = await resp.json()
 
-    assert data["error"]["code"] == "voice_audio_not_supported"
-    assert "Submit a transcript" in data["error"]["message"]
+    assert data["error"]["code"] == "voice_audio_requires_multipart"
+    assert "multipart/form-data" in data["error"]["message"]
 
 
 @pytest.mark.asyncio

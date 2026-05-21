@@ -58,7 +58,10 @@ final class CallViewModel: ObservableObject {
                 if let reply = turn.reply, !reply.isEmpty {
                     messages.append(VoiceMessage(speaker: .hermes, text: reply))
                 }
-                if let audioURL = turn.audioURL {
+                if let audioBase64 = turn.audio?.base64,
+                   let audioData = Data(base64Encoded: audioBase64) {
+                    try player.play(data: audioData)
+                } else if let audioURL = turn.audio?.audioURL ?? turn.audioURL {
                     try await player.play(remoteURL: audioURL)
                 }
                 try await api.endSession(sessionID: session.id)

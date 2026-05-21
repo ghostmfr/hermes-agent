@@ -273,6 +273,7 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = "";
 				GENERATE_INFOPLIST_FILE = NO;
+				HERMES_API_KEY = "";
 				HERMES_SERVER_URL = "http://localhost:8000";
 				INFOPLIST_FILE = HermesVoice/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -299,6 +300,7 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = "";
 				GENERATE_INFOPLIST_FILE = NO;
+				HERMES_API_KEY = "";
 				HERMES_SERVER_URL = "http://localhost:8000";
 				INFOPLIST_FILE = HermesVoice/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
